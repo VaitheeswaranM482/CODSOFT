@@ -1,0 +1,184 @@
+# file_integrity_checker.py
+
+import os
+import hashlib
+import json
+import argparse
+import sys
+
+# Define constants for the script
+HASH_DB_FILE = "hashes.json"
+CHUNK_SIZE = 65536  # 64 KB, a practical chunk size for efficient I/O [1, 2]
+
+def calculate_file_hash(file_path, algorithm='sha256'):
+    """
+    Computes the hash of a file by reading it in chunks to handle large files efficiently.
+    Uses hashlib.new() to allow for different algorithms.
+
+    Args:
+        file_path (str): The path to the file.
+        algorithm (str): The name of the hashing algorithm (e.g., 'sha256').
+
+    Returns:
+        str: The hexadecimal digest of the file's hash, or None on error.
+    """
+    try:
+        # Create a new hash object for the specified algorithm [3]
+        hash_obj = hashlib.new(algorithm)
+        
+        # Open the file in binary read mode ('rb')
+        with open(file_path, "rb") as file:
+            # Read the file in chunks and update the hash object iteratively [4]
+            while chunk := file.read(CHUNK_SIZE):
+                hash_obj.update(chunk)
+                
+        return hash_obj.hexdigest()
+
+    # Gracefully handle common file-related exceptions [5, 6]
+    except FileNotFoundError:
+        return None
+    except PermissionError:
+        return None
+    except Exception as e:
+        print(f"An unexpected error occurred for {file_path}: {e}", file=sys.stderr)
+        return None
+
+def load_hash_db(db_path):
+    """
+    Loads the hash database from a JSON file.
+    Handles cases where the file does not exist or is corrupted.
+
+    Args:
+        db_path (str): The path to the JSON file.
+
+    Returns:
+        dict: A dictionary of file paths and their hashes.
+    """
+    if not os.path.exists(db_path):
+        return {}
+    try:
+        with open(db_path, 'r') as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        # Return an empty dictionary if the file is empty or corrupted [7, 8]
+        print(f"Warning: Hash database file '{db_path}' is corrupted or empty. Creating a new one.")
+        return {}
+
+def save_hash_db(db_path, hash_data):
+    """
+    Saves the hash database to a JSON file.
+
+    Args:
+        db_path (str): The path to the JSON file.
+        hash_data (dict): The dictionary of file hashes to save.
+    """
+    with open(db_path, 'w') as f:
+        json.dump(hash_data, f, indent=4)
+
+def init_command(target_path, algorithm, db_path):
+    """
+    Initializes the hash baseline for a given path.
+    Scans the directory and stores the hash of each file.
+    """
+    print(f"Initializing baseline for '{target_path}'...")
+    hash_data = {}
+    
+    # Use os.walk to recursively traverse the directory tree [9, 10]
+    for root, _, files in os.walk(target_path):
+        for filename in files:
+            file_path = os.path.join(root, filename)
+            file_hash = calculate_file_hash(file_path, algorithm)
+            if file_hash:
+                hash_data[file_path] = file_hash
+                print(f"Hashed: {file_path}")
+    
+    save_hash_db(db_path, hash_data)
+    print(f"Baseline stored successfully in '{db_path}'.")
+
+def check_command(target_path, algorithm, db_path):
+    """
+    Compares the current file hashes to the stored baseline.
+    Reports modified, new, and deleted files.
+    """
+    print(f"Checking integrity of '{target_path}'...")
+    
+    baseline_hashes = load_hash_db(db_path)
+    if not baseline_hashes:
+        print("Error: No baseline found. Please run the 'init' command first.")
+        sys.exit(1)
+        
+    current_hashes = {}
+    
+    # Recalculate hashes for all files in the target path [9, 10]
+    for root, _, files in os.walk(target_path):
+        for filename in files:
+            file_path = os.path.join(root, filename)
+            file_hash = calculate_file_hash(file_path, algorithm)
+            if file_hash:
+                current_hashes[file_path] = file_hash
+
+    modified_files =
+    new_files =
+    deleted_files =
+    
+    # Check for modified or new files [11, 12]
+    for file_path, file_hash in current_hashes.items():
+        if file_path not in baseline_hashes:
+            new_files.append(file_path)
+        elif baseline_hashes[file_path]!= file_hash:
+            modified_files.append(file_path)
+            
+    # Check for deleted files
+    for file_path in baseline_hashes:
+        if file_path not in current_hashes:
+            deleted_files.append(file_path)
+            
+    # Report findings to the user
+    if modified_files or new_files or deleted_files:
+        print("\nIntegrity Check Failed: Discrepancies Found!")
+        if modified_files:
+            print("\nModified Files:")
+            for file in modified_files:
+                print(f"- {file}")
+        if new_files:
+            print("\nNew Files:")
+            for file in new_files:
+                print(f"- {file}")
+        if deleted_files:
+            print("\nDeleted Files:")
+            for file in deleted_files:
+                print(f"- {file}")
+    else:
+        print("\nIntegrity Check Passed: No changes detected.")
+        
+def main():
+    """
+    Main function to parse command-line arguments and run the tool.
+    """
+    parser = argparse.ArgumentParser(
+        description="A File Integrity Checker that monitors changes using hash values."
+    )
+    
+    # Setup subcommands for 'init' and 'check' [13, 1]
+    subparsers = parser.add_subparsers(dest="command", required=True, help="Available commands")
+    
+    # Subparser for the 'init' command
+    init_parser = subparsers.add_parser("init", help="Establish a new file integrity baseline.")
+    init_parser.add_argument("path", help="The directory or file to create a baseline for.")
+    init_parser.add_argument("--algorithm", default="sha256", help="Hashing algorithm to use (e.g., md5, sha256).")
+    
+    # Subparser for the 'check' command
+    check_parser = subparsers.add_parser("check", help="Check the integrity of files against the baseline.")
+    check_parser.add_argument("path", help="The directory or file to check.")
+    check_parser.add_argument("--algorithm", default="sha256", help="Hashing algorithm to use (must match the one used for 'init').")
+    
+    args = parser.parse_args()
+    
+    # Determine which command was used and call the appropriate function
+    if args.command == "init":
+        init_command(args.path, args.algorithm, HASH_DB_FILE)
+    elif args.command == "check":
+        check_command(args.path, args.algorithm, HASH_DB_FILE)
+
+if __name__ == "__main__":
+    main()
