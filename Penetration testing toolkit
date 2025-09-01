@@ -1,0 +1,349 @@
+# toolkit.py
+
+import os
+import sys
+import hashlib
+import json
+import argparse
+import socket
+from concurrent.futures import ThreadPoolExecutor
+import time
+from urllib.parse import urljoin, urlparse
+
+# Define external library dependencies
+try:
+    import requests
+    from bs4 import BeautifulSoup
+except ImportError:
+    print("Required libraries 'requests' and 'beautifulsoup4' are not installed.", file=sys.stderr)
+    print("Please install them using: pip install requests beautifulsoup4", file=sys.stderr)
+    sys.exit(1)
+
+# Global constants for configuration
+HASH_DB_FILE = "toolkit_integrity.json"
+CHUNK_SIZE = 8192 # Optimal for I/O operations [1, 2]
+DEFAULT_PORT_RANGE = "1-1024"
+
+# --- Module 1: Port Scanner ---
+
+class PortScanner:
+    """
+    A multi-threaded TCP port scanner to identify open ports on a target host.
+    """
+    def __init__(self, target: str, port_range: str, max_threads: int):
+        self.target = target
+        self.ports = self._parse_port_range(port_range)
+        self.max_threads = max_threads
+        self.open_ports =
+        self.lock = threading.Lock()
+
+    def _parse_port_range(self, port_range: str) -> list[int]:
+        """Parses a string of ports (e.g., '1-100,200') into a list of integers."""
+        ports = set()
+        for part in port_range.split(','):
+            if '-' in part:
+                start, end = map(int, part.split('-'))
+                ports.update(range(start, end + 1))
+            else:
+                ports.add(int(part))
+        return sorted(list(ports))
+
+    def _scan_port(self, port: int, timeout: float = 1.0):
+        """
+        Attempts to connect to a single port on the target host.
+        Uses connect_ex() for non-blocking connection attempts.[3, 4]
+        """
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            result = s.connect_ex((self.target, port))
+            if result == 0:
+                with self.lock:
+                    print(f"[+] Port {port} is OPEN")
+                    self.open_ports.append(port)
+            else:
+                with self.lock:
+                    print(f"[-] Port {port} is closed or filtered", end="\r", flush=True)
+
+    def scan(self):
+        """
+        Orchestrates the port scanning using a thread pool for concurrency,
+        which significantly speeds up I/O-bound tasks.[5, 6, 7]
+        """
+        print(f"Starting scan on {self.target}...")
+        try:
+            with ThreadPoolExecutor(max_workers=self.max_threads) as executor:
+                executor.map(self._scan_port, self.ports)
+        except (socket.gaierror, socket.error) as e:
+            print(f"Error resolving target host: {e}", file=sys.stderr)
+            sys.exit(1)
+        finally:
+            print("\nScan complete.")
+            if self.open_ports:
+                print(f"Open ports: {sorted(self.open_ports)}")
+            else:
+                print("No open ports found.")
+
+# --- Module 2: Authentication Brute-Forcer ---
+
+class BruteForcer:
+    """
+    A web form brute-forcer that attempts to guess credentials from a wordlist.
+    """
+    def __init__(self, url: str, user_field: str, pass_field: str, user: str, wordlist: str):
+        self.url = url
+        self.user_field = user_field
+        self.pass_field = pass_field
+        self.user = user
+        self.wordlist = wordlist
+        self.session = requests.Session() # Use a session for persistent cookies [8, 9]
+        self.found = False
+
+    def _get_form_details(self, response: requests.Response) -> dict:
+        """
+        Parses the login form to extract its action URL, method, and input fields.
+        This is crucial for handling dynamic forms and CSRF tokens.[10, 11, 12]
+        """
+        soup = BeautifulSoup(response.text, 'html.parser')
+        form = soup.find('form')
+        
+        if not form:
+            return {}
+
+        details = {
+            'action': form.get('action', ''),
+            'method': form.get('method', 'post').lower(),
+            'inputs': {}
+        }
+
+        for input_tag in form.find_all('input'):
+            input_name = input_tag.get('name')
+            input_type = input_tag.get('type', 'text').lower()
+            input_value = input_tag.get('value', '')
+
+            if input_name:
+                details['inputs'][input_name] = input_value
+        
+        return details
+
+    def run(self):
+        """
+        Executes the brute-force attack using a provided wordlist.
+        """
+        print(f"Starting brute-force attack on {self.url}...")
+
+        try:
+            # First, get the login page to scrape form details and any CSRF tokens [10, 12]
+            get_response = self.session.get(self.url)
+            form_details = self._get_form_details(get_response)
+            
+            if not form_details:
+                print("Error: No login form found on the page.", file=sys.stderr)
+                return
+
+            action_url = urljoin(self.url, form_details['action'])
+            
+            with open(self.wordlist, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    password = line.strip()
+                    if not password:
+                        continue
+                    
+                    # Prepare the form data for the POST request [13, 14]
+                    form_data = form_details['inputs'].copy()
+                    form_data[self.user_field] = self.user
+                    form_data[self.pass_field] = password
+                    
+                    print(f"Trying password: {password:<20}", end='\r', flush=True)
+
+                    if form_details['method'] == 'post':
+                        post_response = self.session.post(action_url, data=form_data)
+                    else:
+                        post_response = self.session.get(action_url, params=form_data)
+
+                    # Check for successful login. This is a heuristic and may need adjustment.
+                    # A common sign of success is a redirect or a different page title/content.
+                    if post_response.status_code == 200 and "dashboard" in post_response.text:
+                        print(f"\n[+] Credentials found! User: {self.user}, Password: {password}")
+                        self.found = True
+                        break
+                    
+        except FileNotFoundError:
+            print(f"\nError: Wordlist file not found at '{self.wordlist}'.", file=sys.stderr)
+        except requests.exceptions.RequestException as e:
+            print(f"\nError during HTTP request: {e}", file=sys.stderr)
+        except Exception as e:
+            print(f"\nAn unexpected error occurred: {e}", file=sys.stderr)
+        
+        if not self.found:
+            print("\n[-] Brute-force attack finished. No credentials found.")
+
+# --- Module 3: File Integrity Checker ---
+
+class FileIntegrityChecker:
+    """
+    Manages the creation and verification of file integrity baselines.
+    """
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+
+    def _calculate_file_hash(self, file_path: str, algorithm: str = 'sha256') -> str:
+        """
+        Computes the hash of a file by reading it in chunks for memory efficiency.[1, 2]
+        """
+        try:
+            hash_obj = hashlib.new(algorithm)
+            with open(file_path, "rb") as file:
+                while chunk := file.read(CHUNK_SIZE):
+                    hash_obj.update(chunk)
+            return hash_obj.hexdigest()
+        except (FileNotFoundError, PermissionError) as e:
+            print(f"Error: Could not access file '{file_path}'. {e}", file=sys.stderr)
+            return None
+
+    def _load_db(self) -> dict:
+        """Loads the hash database from a JSON file.[15, 16]"""
+        if not os.path.exists(self.db_path):
+            return {}
+        try:
+            with open(self.db_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            print(f"Warning: Hash database file '{self.db_path}' is corrupted or empty. A new one will be created.", file=sys.stderr)
+            return {}
+
+    def _save_db(self, data: dict):
+        """Saves the hash database to a JSON file.[15, 16]"""
+        try:
+            with open(self.db_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4)
+        except IOError as e:
+            print(f"Error: Could not save data to '{self.db_path}'. {e}", file=sys.stderr)
+            sys.exit(1)
+
+    def init_baseline(self, target_path: str):
+        """
+        Creates an initial integrity baseline by hashing all files in a path.
+        """
+        print(f"Creating baseline for '{target_path}'...")
+        hash_data = {}
+        for root, _, files in os.walk(target_path): # Use os.walk for recursive traversal [17, 18]
+            for filename in files:
+                file_path = os.path.join(root, filename)
+                file_hash = self._calculate_file_hash(file_path)
+                if file_hash:
+                    hash_data[file_path] = file_hash
+                    print(f"Hashed: {file_path}")
+        
+        self._save_db(hash_data)
+        print(f"Baseline with {len(hash_data)} files stored successfully in '{self.db_path}'.")
+
+    def check_integrity(self, target_path: str):
+        """
+        Compares current file hashes to the stored baseline.[19, 20]
+        Reports modified, new, and deleted files.
+        """
+        print(f"Checking integrity of '{target_path}' against baseline...")
+        
+        baseline_hashes = self._load_db()
+        if not baseline_hashes:
+            print("Error: No baseline found. Please run 'init' first.", file=sys.stderr)
+            sys.exit(1)
+            
+        current_hashes = {}
+        for root, _, files in os.walk(target_path):
+            for filename in files:
+                file_path = os.path.join(root, filename)
+                file_hash = self._calculate_file_hash(file_path)
+                if file_hash:
+                    current_hashes[file_path] = file_hash
+
+        modified_files =
+        new_files =
+        deleted_files =
+        
+        # Check for modified or new files
+        for file_path, file_hash in current_hashes.items():
+            if file_path not in baseline_hashes:
+                new_files.append(file_path)
+            elif baseline_hashes[file_path]!= file_hash:
+                modified_files.append(file_path)
+                
+        # Check for deleted files
+        for file_path in baseline_hashes:
+            if file_path not in current_hashes:
+                deleted_files.append(file_path)
+                
+        # Report findings
+        if modified_files or new_files or deleted_files:
+            print("\nIntegrity Check FAILED: Discrepancies Found!")
+            if modified_files:
+                print("\nModified Files:")
+                for file in modified_files:
+                    print(f"- {file}")
+            if new_files:
+                print("\nNew Files:")
+                for file in new_files:
+                    print(f"- {file}")
+            if deleted_files:
+                print("\nDeleted Files:")
+                for file in deleted_files:
+                    print(f"- {file}")
+        else:
+            print("\nIntegrity Check PASSED: No changes detected.")
+
+# --- Main CLI Entry Point ---
+
+def main():
+    """
+    Main function to parse command-line arguments and dispatch commands.
+    """
+    parser = argparse.ArgumentParser(
+        description="A Python-based modular toolkit for penetration testing.",
+        epilog="Remember to always obtain explicit, written permission before using these tools."
+    )
+    
+    subparsers = parser.add_subparsers(dest="command", required=True, help="Available commands")
+    
+    # Port Scanner Subcommand
+    scan_parser = subparsers.add_parser("scan", help="Perform a TCP port scan on a target host.")
+    scan_parser.add_argument("target", help="The target IP address or hostname.")
+    scan_parser.add_argument("--ports", default=DEFAULT_PORT_RANGE, help=f"Port range to scan (e.g., '22,80,443' or '1-1024'). Default is {DEFAULT_PORT_RANGE}.")
+    scan_parser.add_argument("--threads", type=int, default=100, help="Number of concurrent threads for scanning. Default is 100.")
+    
+    # Brute-Forcer Subcommand
+    brute_parser = subparsers.add_parser("brute", help="Perform a dictionary-based brute-force attack on a web form.")
+    brute_parser.add_argument("url", help="The URL of the login form.")
+    brute_parser.add_argument("user", help="The username to test.")
+    brute_parser.add_argument("wordlist", help="Path to the password wordlist file.")
+    brute_parser.add_argument("--user-field", default="username", help="The name attribute of the username input field. Default is 'username'.")
+    brute_parser.add_argument("--pass-field", default="password", help="The name attribute of the password input field. Default is 'password'.")
+
+    # File Integrity Checker Subcommand
+    integrity_parser = subparsers.add_parser("integrity", help="Monitor file integrity using hash values.")
+    integrity_subparsers = integrity_parser.add_subparsers(dest="integrity_command", required=True)
+    
+    # FIM: Init subcommand
+    init_parser = integrity_subparsers.add_parser("init", help="Create a new integrity baseline.")
+    init_parser.add_argument("path", help="The directory or file to create a baseline for.")
+    
+    # FIM: Check subcommand
+    check_parser = integrity_subparsers.add_parser("check", help="Check integrity against the stored baseline.")
+    check_parser.add_argument("path", help="The directory or file to check.")
+    
+    args = parser.parse_args()
+    
+    if args.command == "scan":
+        scanner = PortScanner(args.target, args.ports, args.threads)
+        scanner.scan()
+    elif args.command == "brute":
+        brute_forcer = BruteForcer(args.url, args.user_field, args.pass_field, args.user, args.wordlist)
+        brute_forcer.run()
+    elif args.command == "integrity":
+        fim = FileIntegrityChecker(HASH_DB_FILE)
+        if args.integrity_command == "init":
+            fim.init_baseline(args.path)
+        elif args.integrity_command == "check":
+            fim.check_integrity(args.path)
+
+if __name__ == "__main__":
+    main()
