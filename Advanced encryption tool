@@ -1,0 +1,201 @@
+#!/usr/bin/env python3 """ Advanced File Encryptor v1.0
+
+Features:
+
+AES-256-GCM authenticated encryption
+
+Password-based key derivation (PBKDF2-HMAC-SHA256)
+
+Secure random salt and nonce
+
+Simple Tkinter GUI + CLI fallback
+
+File header format to store metadata (magic, version, salt, nonce)
+
+
+Limitations:
+
+Uses in-memory encryption (reads whole file). For extremely large files, consider modifying to a streaming scheme.
+
+
+Dependencies:
+
+cryptography (pip install cryptography)
+
+
+Usage (CLI): python advanced_file_encryptor.py --encrypt input.file output.enc python advanced_file_encryptor.py --decrypt input.enc output.file
+
+Or run without args to use the GUI.
+
+Header format (binary):
+
+8 bytes: MAGIC = b'AFE1.0\x00' (application magic + version)
+
+1 byte : algorithm version (0x01)
+
+16 bytes: salt (for PBKDF2)
+
+12 bytes: nonce (for AES-GCM)
+
+remaining: ciphertext + tag (produced by AES-GCM)
+
+
+Keep your password safe. Losing the password means losing access to the data. """
+
+import os import struct import argparse import getpass import tkinter as tk from tkinter import ttk, filedialog, messagebox from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC from cryptography.hazmat.primitives import hashes from cryptography.hazmat.primitives.ciphers.aead import AESGCM from cryptography.hazmat.backends import default_backend from base64 import urlsafe_b64encode
+
+MAGIC = b'AFE1.0\x00'  # 8 bytes ALG_VER = b'\x01'      # 1 byte SALT_SIZE = 16 NONCE_SIZE = 12 PBKDF2_ITERS = 200_000  # iterations for PBKDF2 KEY_SIZE = 32  # AES-256
+
+def derive_key(password: bytes, salt: bytes, iterations: int = PBKDF2_ITERS) -> bytes: """Derive a symmetric key from a password and salt using PBKDF2-HMAC-SHA256.""" kdf = PBKDF2HMAC( algorithm=hashes.SHA256(), length=KEY_SIZE, salt=salt, iterations=iterations, backend=default_backend(), ) return kdf.derive(password)
+
+def encrypt_bytes(plaintext: bytes, password: str) -> bytes: """Encrypt data with a password. Returns full payload (header + ciphertext+tag).""" salt = os.urandom(SALT_SIZE) nonce = os.urandom(NONCE_SIZE) key = derive_key(password.encode('utf-8'), salt) aesgcm = AESGCM(key) ciphertext = aesgcm.encrypt(nonce, plaintext, None) header = MAGIC + ALG_VER + salt + nonce return header + ciphertext
+
+def decrypt_bytes(payload: bytes, password: str) -> bytes: """Decrypt payload created by encrypt_bytes. Raises ValueError on failure.""" if len(payload) < len(MAGIC) + 1 + SALT_SIZE + NONCE_SIZE + 16: raise ValueError('Payload too short or corrupted') pos = 0 magic = payload[pos:pos+len(MAGIC)]; pos += len(MAGIC) if magic != MAGIC: raise ValueError('Invalid file format (magic mismatch)') ver = payload[pos:pos+1]; pos += 1 if ver != ALG_VER: raise ValueError(f'Unsupported algorithm version: {ver!r}') salt = payload[pos:pos+SALT_SIZE]; pos += SALT_SIZE nonce = payload[pos:pos+NONCE_SIZE]; pos += NONCE_SIZE ciphertext = payload[pos:] key = derive_key(password.encode('utf-8'), salt) aesgcm = AESGCM(key) plaintext = aesgcm.decrypt(nonce, ciphertext, None) return plaintext
+
+def encrypt_file(in_path: str, out_path: str, password: str) -> None: with open(in_path, 'rb') as f: data = f.read() payload = encrypt_bytes(data, password) with open(out_path, 'wb') as f: f.write(payload)
+
+def decrypt_file(in_path: str, out_path: str, password: str) -> None: with open(in_path, 'rb') as f: payload = f.read() data = decrypt_bytes(payload, password) with open(out_path, 'wb') as f: f.write(data)
+
+-----------------------
+
+GUI Implementation
+
+-----------------------
+
+class EncryptorGUI(tk.Tk): def init(self): super().init() self.title('Advanced File Encryptor') self.geometry('560x300') self.resizable(False, False) self.create_widgets()
+
+def create_widgets(self):
+    pad = {'padx': 10, 'pady': 8}
+
+    frame = ttk.Frame(self)
+    frame.pack(fill='both', expand=True, **pad)
+
+    # File selection
+    ttk.Label(frame, text='File:').grid(row=0, column=0, sticky='w')
+    self.file_var = tk.StringVar()
+    ttk.Entry(frame, textvariable=self.file_var, width=52).grid(row=0, column=1, columnspan=2, sticky='w')
+    ttk.Button(frame, text='Browse', command=self.browse_file).grid(row=0, column=3)
+
+    # Output
+    ttk.Label(frame, text='Output:').grid(row=1, column=0, sticky='w')
+    self.out_var = tk.StringVar()
+    ttk.Entry(frame, textvariable=self.out_var, width=52).grid(row=1, column=1, columnspan=2, sticky='w')
+    ttk.Button(frame, text='Browse', command=self.browse_out).grid(row=1, column=3)
+
+    # Mode
+    ttk.Label(frame, text='Mode:').grid(row=2, column=0, sticky='w')
+    self.mode_var = tk.StringVar(value='encrypt')
+    ttk.Radiobutton(frame, text='Encrypt', variable=self.mode_var, value='encrypt', command=self.on_mode).grid(row=2, column=1, sticky='w')
+    ttk.Radiobutton(frame, text='Decrypt', variable=self.mode_var, value='decrypt', command=self.on_mode).grid(row=2, column=2, sticky='w')
+
+    # Password
+    ttk.Label(frame, text='Password:').grid(row=3, column=0, sticky='w')
+    self.pw_var = tk.StringVar()
+    ttk.Entry(frame, textvariable=self.pw_var, show='*', width=38).grid(row=3, column=1, columnspan=2, sticky='w')
+    ttk.Button(frame, text='Generate strong pass', command=self.gen_pass).grid(row=3, column=3)
+
+    # Options
+    ttk.Label(frame, text='PBKDF2 Iterations:').grid(row=4, column=0, sticky='w')
+    self.iter_var = tk.IntVar(value=PBKDF2_ITERS)
+    ttk.Entry(frame, textvariable=self.iter_var, width=18).grid(row=4, column=1, sticky='w')
+
+    # Buttons
+    self.run_button = ttk.Button(frame, text='Run', command=self.run_action)
+    self.run_button.grid(row=5, column=1, sticky='w', pady=12)
+    ttk.Button(frame, text='About / Help', command=self.show_help).grid(row=5, column=2, sticky='w')
+
+    # Status
+    self.status_var = tk.StringVar(value='Ready')
+    ttk.Label(frame, textvariable=self.status_var).grid(row=6, column=0, columnspan=4, sticky='w')
+
+def browse_file(self):
+    path = filedialog.askopenfilename()
+    if path:
+        self.file_var.set(path)
+        if not self.out_var.get():
+            default_out = path + ('.enc' if self.mode_var.get() == 'encrypt' else '.dec')
+            self.out_var.set(default_out)
+
+def browse_out(self):
+    path = filedialog.asksaveasfilename()
+    if path:
+        self.out_var.set(path)
+
+def on_mode(self):
+    # adjust default out extension when mode changes
+    inpath = self.file_var.get()
+    if inpath:
+        self.out_var.set(inpath + ('.enc' if self.mode_var.get() == 'encrypt' else '.dec'))
+
+def gen_pass(self):
+    # generate a reasonably strong password (not guaranteed memorable)
+    import secrets, string
+    alphabet = string.ascii_letters + string.digits + '!@#$%^&*()-_+='
+    pw = ''.join(secrets.choice(alphabet) for _ in range(20))
+    self.pw_var.set(pw)
+    messagebox.showinfo('Password generated', 'A strong password has been generated and placed in the password field. Save it somewhere safe.')
+
+def show_help(self):
+    help_text = (
+        'This tool uses AES-256-GCM with PBKDF2-HMAC-SHA256 to derive the key from the password.\n\n'
+        'Important:\n- Remember your password. Without it, data is unrecoverable.\n- Keep backups of your encrypted files.\n- Iterations increase security but slow down operation. Default is 200,000.\n- For very large files consider CLI + streaming-aware tools.'
+    )
+    messagebox.showinfo('About / Help', help_text)
+
+def run_action(self):
+    in_path = self.file_var.get()
+    out_path = self.out_var.get()
+    mode = self.mode_var.get()
+    password = self.pw_var.get()
+    iterations = int(self.iter_var.get())
+
+    if not in_path or not out_path:
+        messagebox.showerror('Error', 'Please select input and output files.')
+        return
+    if not password:
+        messagebox.showerror('Error', 'Please provide a password (or generate one).')
+        return
+
+    self.status_var.set('Working...')
+    self.update_idletasks()
+    try:
+        global PBKDF2_ITERS
+        PBKDF2_ITERS = iterations
+        if mode == 'encrypt':
+            encrypt_file(in_path, out_path, password)
+        else:
+            decrypt_file(in_path, out_path, password)
+    except Exception as e:
+        self.status_var.set('Failed')
+        messagebox.showerror('Error', f'Operation failed: {e}')
+        return
+    self.status_var.set('Completed')
+    messagebox.showinfo('Success', 'Operation completed successfully.')
+
+-----------------------
+
+CLI
+
+-----------------------
+
+def cli_main(): parser = argparse.ArgumentParser(description='Advanced File Encryptor') group = parser.add_mutually_exclusive_group(required=True) group.add_argument('--encrypt', action='store_true', help='Encrypt mode') group.add_argument('--decrypt', action='store_true', help='Decrypt mode') parser.add_argument('infile', help='Input file path') parser.add_argument('outfile', help='Output file path') parser.add_argument('--password', '-p', help='Password (if omitted, will prompt)') parser.add_argument('--iterations', type=int, default=PBKDF2_ITERS, help='PBKDF2 iterations') args = parser.parse_args()
+
+password = args.password
+if not password:
+    password = getpass.getpass('Password: ')
+
+try:
+    global PBKDF2_ITERS
+    PBKDF2_ITERS = args.iterations
+    if args.encrypt:
+        encrypt_file(args.infile, args.outfile, password)
+    else:
+        decrypt_file(args.infile, args.outfile, password)
+except Exception as e:
+    print('Operation failed:', e)
+    return 2
+print('Done.')
+return 0
+
+if name == 'main': import sys if len(sys.argv) > 1: sys.exit(cli_main()) else: app = EncryptorGUI() app.mainloop()
+
